@@ -1,0 +1,289 @@
+// FILENAME: draw_poly.cpp
+/* **********************************************/
+/*                                              */
+/*   Author:      Leo Mandoka & Trey Nieman      */
+/*   Date:        2/4/2026                      */
+/*   Project:     Lab #3 for EGRS 372            */
+/*   Purpose:     Program a mobile robot to     */
+/*                travel in a polygon or circle */
+/*                using TurtleBot3 and ROS      */
+/*                                              */
+/* **********************************************/
+
+// -------------------- LIBRARIES --------------------
+// Core ROS functionality
+#include "ros/ros.h"
+
+// Standard C++ libraries
+#include <sstream>
+#include <iostream>
+#include <cmath>
+
+// ROS message types
+#include "geometry_msgs/Twist.h"   // Used to send velocity commands
+#include "tf/tfMessage.h"          // Used to receive robot pose data
+
+// -------------------- CONSTANTS --------------------
+// Sentinel value used to detect uninitialized variables
+#define INITIALIZE_VALUE -1
+
+// Mathematical constant for pi
+#define PI 3.14159265359
+
+// -------------------- GLOBAL VARIABLES --------------------
+// Control flag used to stop forward or turning motion
+bool flag;
+
+// Robot orientation tracking
+double current_angle = 0;
+
+// Motion control values
+double target_speed = 0.0;
+double target_angle = INITIALIZE_VALUE;
+double target_forward = INITIALIZE_VALUE;
+
+// Distance tracking
+double moved = 0;
+double initialx = INITIALIZE_VALUE;
+double initialy = INITIALIZE_VALUE;
+
+// User inputs
+int numSides = INITIALIZE_VALUE;
+double sideLength = INITIALIZE_VALUE;
+
+// ============================================================
+// FORWARD MOVEMENT CALLBACK
+// ============================================================
+// This function is triggered whenever new /tf data is received.
+// It computes how far the robot has moved from its starting
+// position and stops the robot once the desired distance is met.
+void forwardprog(const tf::tfMessage cvalue)
+{
+    double dx, dy;
+
+    // Store initial position on first callback
+    if(initialx == INITIALIZE_VALUE || initialy == INITIALIZE_VALUE)
+    {
+        initialx = cvalue.transforms[0].transform.translation.x;
+        initialy = cvalue.transforms[0].transform.translation.y;
+    }
+
+    // Calculate displacement from start position
+    dx = std::abs(cvalue.transforms[0].transform.translation.x - initialx);
+    dy = std::abs(cvalue.transforms[0].transform.translation.y - initialy);
+
+    // Euclidean distance traveled
+    moved = std::sqrt(dx*dx + dy*dy);
+
+    // Stop moving forward when target distance is reached
+    if(moved >= target_forward)
+        flag = false;
+
+    // Proportional speed control (slows as robot approaches target)
+    target_speed = std::abs(target_forward - moved)/4 + 0.1;
+}
+
+// ============================================================
+// TURNING CALLBACK (RIGHT TURN)
+// ============================================================
+// Uses quaternion orientation data to compute the robot's yaw
+// angle and rotates the robot clockwise by the required angle
+// for a polygon.
+void Turnprog(const tf::tfMessage cvalue)
+{
+    double turnz = cvalue.transforms[0].transform.rotation.z;
+    double turnw = cvalue.transforms[0].transform.rotation.w;
+
+    // Convert quaternion to yaw angle
+    current_angle = 2 * std::atan2(turnz, turnw);
+
+    // Normalize angle into [0, 2π]
+    if(current_angle < 0) current_angle += 2*PI;
+    if(current_angle >= 2*PI) current_angle -= 2*PI;
+
+    // Initialize target angle on first callback
+    if(target_angle == INITIALIZE_VALUE)
+    {
+        // Polygon exterior angle (right turn)
+        target_angle = current_angle - (2*PI/numSides);
+        if(target_angle < 0) target_angle += 2*PI;
+    }
+
+    // Calculate angular difference (clockwise)
+    double angle_diff = current_angle - target_angle;
+    if(angle_diff < 0) angle_diff += 2*PI;
+
+    // Stop turning once close enough to target angle
+    if(angle_diff < 0.1)
+    {
+        flag = false;
+        target_speed = 0.0;
+        return;
+    }
+
+    // Proportional turning speed
+    target_speed = angle_diff / PI + 0.5;
+}
+
+// ============================================================
+// MAIN PROGRAM
+// ============================================================
+// Initializes ROS, gathers user input, and controls robot motion
+// using publishers and subscribers. The robot either moves in a
+// polygon or switches to circular motion for large side counts.
+int main(int argc, char **argv)
+{
+    // Initialize ROS node
+    ros::init(argc, argv, "lab3_tutorial");
+    ros::NodeHandle n;
+
+    // Publisher for velocity commands
+    ros::Publisher vel_pub = n.advertise<geometry_msgs::Twist>("cmd_vel", 1000);
+
+    // Subscriber for tf data (assigned later)
+    ros::Subscriber tf;
+
+    // Loop frequency (100 Hz)
+    ros::Rate loop_rate(100);
+
+    // ---------------- USER INPUT ----------------
+    // Get number of sides for polygon
+    std::cout << "Enter Number of Sides (>1): ";
+    while(ros::ok())
+    {
+        std::cin >> numSides;
+        if(numSides > 1) break;
+        std::cout << "ERROR: Number of sides must be greater than 1. Try again: ";
+    }
+
+    // Get side length
+    std::cout << "Enter Length Of Side (0.1 - 1.0): ";
+    while(ros::ok())
+    {
+        std::cin >> sideLength;
+        if(sideLength > 0.09 && sideLength < 1.01) break;
+        std::cout << "ERROR: Intended Length is 0.1-1.0. Try again: ";
+    }
+
+    target_forward = sideLength;
+
+    // Initialize velocity message
+    geometry_msgs::Twist c;
+    c.linear.x = 0.0;
+    c.angular.z = 0.0;
+
+    // ---------------- CIRCLE MODE ----------------
+    // If the number of sides is large, approximate a circle
+    bool circleMode = (numSides > 10);
+
+    if(circleMode)
+    {
+        std::cout << "Circle mode activated (radius = " << sideLength << " m)\n";
+
+        double linearSpeed = 0.2;
+        double angularSpeed = linearSpeed / sideLength;
+
+        double totalRotation = 0.0;
+        double prev_angle = current_angle;
+
+        // Subscribe to tf for orientation tracking
+        tf = n.subscribe("/tf", 1, Turnprog);
+        ros::spinOnce();
+        loop_rate.sleep();
+
+        // Continue until one full rotation is completed
+        while(ros::ok() && totalRotation < 2*PI)
+        {
+            double delta = current_angle - prev_angle;
+            if(delta > PI) delta -= 2*PI;
+            if(delta < -PI) delta += 2*PI;
+
+            totalRotation += std::abs(delta);
+            prev_angle = current_angle;
+
+            c.linear.x = linearSpeed;
+            c.angular.z = -angularSpeed;
+            vel_pub.publish(c);
+
+            ros::spinOnce();
+            loop_rate.sleep();
+        }
+
+        // Stop robot
+        c.linear.x = 0.0;
+        c.angular.z = 0.0;
+        vel_pub.publish(c);
+        tf.shutdown();
+    }
+    else
+    {
+        // ---------------- POLYGON MODE ----------------
+        // Repeat forward motion and turning for each side
+        for(int i = 0; i < numSides; i++)
+        {
+            // ---- MOVE FORWARD ----
+            flag = true;
+            moved = 0;
+            initialx = INITIALIZE_VALUE;
+            initialy = INITIALIZE_VALUE;
+
+            tf = n.subscribe("/tf", 1, forwardprog);
+            ros::spinOnce();
+            loop_rate.sleep();
+
+            while(flag && ros::ok())
+            {
+                c.linear.x = target_speed;
+                c.angular.z = 0.0;
+                vel_pub.publish(c);
+
+                ros::spinOnce();
+                loop_rate.sleep();
+            }
+            tf.shutdown();
+
+            // Brief pause between actions
+            ros::Time go = ros::Time::now();
+            while(ros::Time::now() - go < ros::Duration(0.1))
+            {
+                c.linear.x = 0.0;
+                c.angular.z = 0.0;
+                vel_pub.publish(c);
+                ros::spinOnce();
+                loop_rate.sleep();
+            }
+
+            // ---- TURN RIGHT ----
+            flag = true;
+            target_angle = INITIALIZE_VALUE;
+
+            tf = n.subscribe("/tf", 1, Turnprog);
+            ros::spinOnce();
+            loop_rate.sleep();
+
+            while(flag && ros::ok())
+            {
+                c.linear.x = 0.0;
+                c.angular.z = -target_speed;
+                vel_pub.publish(c);
+
+                ros::spinOnce();
+                loop_rate.sleep();
+            }
+            tf.shutdown();
+
+            // Short stop after turn
+            go = ros::Time::now();
+            while(ros::Time::now() - go < ros::Duration(0.1))
+            {
+                c.linear.x = 0.0;
+                c.angular.z = 0.0;
+                vel_pub.publish(c);
+                ros::spinOnce();
+                loop_rate.sleep();
+            }
+        }
+    }
+
+    return 0;
+}
