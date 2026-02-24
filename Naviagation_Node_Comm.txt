@@ -1,0 +1,235 @@
+// FILENAME:
+// navigation_node.cpp
+/* **********************************************/
+/*                                              */
+/*   Author:      Leo Mandoka & Trey Nieman     */
+/*   Date:        2/24/2026                     */
+/*   Project:     lab #4 for EGRS 372           */
+/*   Purpose:     Program mobile robot to       */
+/*                read and react to barcodes    */
+/*                (TurtleBot3, running ROS)     */
+/*                                              */
+/* **********************************************/
+//Set libaries for the program to call and use throught out the program.
+#include "ros/ros.h"
+#include <cmath>
+#include "geometry_msgs/Twist.h"
+#include "tf/tfMessage.h"
+#include "std_msgs/String.h"
+
+//defined variables for mathamtics
+#define PI 3.14159265359
+
+//Publisher scripts.
+ros::Publisher vel_pub;
+
+// Motion state machine for robot behavior
+// IDLE = waiting for barcode
+// FORWARD = moving straight to target distance
+// TURN = rotating to target angle
+enum MotionState {IDLE, FORWARD, TURN};
+MotionState state = IDLE;
+
+//variables for calculations and final locations.
+double current_x = 0;
+double current_y = 0;
+double current_angle = 0;
+
+double start_x = 0;
+double start_y = 0;
+
+double target_distance = 0;
+double target_angle = 0;
+
+int step = 0;
+bool clockwise_mode = true;
+int pattern = 0;   // 1=square, 2=barcode3
+
+// ================= TF CALLBACK =================
+//Calculates the location of the MR 
+void tfCallback(const tf::tfMessage::ConstPtr& msg)
+{
+    current_x = msg->transforms[0].transform.translation.x;
+    current_y = msg->transforms[0].transform.translation.y;
+
+    double z = msg->transforms[0].transform.rotation.z;
+    double w = msg->transforms[0].transform.rotation.w;
+
+    current_angle = 2 * atan2(z, w);
+    if(current_angle < 0) current_angle += 2*PI;
+
+    geometry_msgs::Twist cmd;
+
+    if(state == FORWARD)
+    //Sets MR to moveforward to an odemetry bound position.
+    {
+        //Equations for the operation.
+        double dx = current_x - start_x;
+        double dy = current_y - start_y;
+        double moved = sqrt(dx*dx + dy*dy);
+
+        if(moved >= target_distance)
+        {
+            cmd.linear.x = 0;
+            vel_pub.publish(cmd);
+
+            step++;
+
+            // ================= SQUARE =================
+            //Commands MR to do a square with odemetry. 
+            if(pattern == 1)
+{
+    if(step >= 4)
+    {
+        state = IDLE;
+        return;
+    }
+
+    double turn_angle = 85.0 * PI / 180.0;
+
+    target_angle += (clockwise_mode ? -turn_angle : turn_angle);
+
+    if(target_angle < 0) target_angle += 2*PI;
+    if(target_angle >= 2*PI) target_angle -= 2*PI;
+
+    state = TURN;
+    return;
+}
+
+            // ================= BARCODE 3 =================
+	    //Conducts a defined turn based on the read barcode.
+            if(pattern == 2)
+            {
+                if(step == 1)
+                {
+                    target_angle += PI;
+                    if(target_angle >= 2*PI) target_angle -= 2*PI;
+                    state = TURN;
+                    return;
+                }
+                else
+                {
+                    state = IDLE;
+                    return;
+                }
+            }
+        }
+
+        cmd.linear.x = 0.25;
+        vel_pub.publish(cmd);
+    }
+    //Set statement to conduct the odometry turns of the MR to reach the desired angle. 
+    else if(state == TURN)
+    {
+        double diff = target_angle - current_angle;
+	// Normalize angle difference to range [-PI, PI]
+        // Ensures robot turns the shortest direction
+        while(diff > PI) diff -= 2*PI;
+        while(diff < -PI) diff += 2*PI;
+
+        if(fabs(diff) < 0.05)
+        {
+            // Rotate at constant speed toward target angle
+            // Positive = counterclockwise, Negative = clockwise
+            cmd.angular.z = 0;
+            vel_pub.publish(cmd);
+
+            start_x = current_x;
+            start_y = current_y;
+
+            // After turn → move forward
+            if(pattern == 1)
+            {
+                state = FORWARD;
+                return;
+            }
+
+            if(pattern == 2)
+            {
+                if(step == 0)
+                {
+                    state = FORWARD;
+                    return;
+                }
+                else if(step == 1)
+                {
+                    target_distance = 2.0;
+                    state = FORWARD;
+                    return;
+                }
+            }
+        }
+
+        cmd.angular.z = (diff > 0 ? 0.6 : -0.6);
+        vel_pub.publish(cmd);
+    }
+}
+
+// ================= START SQUARE =================
+//Begins the MR square function to move the MR into a defined square pattern after reading a defined barcode.
+void startSquare(bool clockwise)
+{
+    clockwise_mode = clockwise;
+    pattern = 1;
+    step = 0;
+
+    start_x = current_x;
+    start_y = current_y;
+
+    target_distance = 1.0;
+    target_angle = current_angle;
+
+    state = FORWARD;
+}
+
+// ================= START BARCODE 3 =================
+//Begubs the MR function for barcode three after reading the defined barcode.
+void startBarcode3()
+{
+    pattern = 2;
+    step = 0;
+
+    target_angle = current_angle + PI;
+    if(target_angle >= 2*PI) target_angle -= 2*PI;
+
+    target_distance = 2.0;
+
+    state = TURN;
+}
+
+// ================= BARCODE CALLBACK =================
+//Call back function to choose which of the functions should be operatered depending on which barcode is seen and read. 
+void barcodeCallback(const std_msgs::String::ConstPtr& msg)
+{
+    std::string code = msg->data;
+
+    if(state != IDLE) return;
+    // Barcode A → square clockwise
+    // Barcode B → square counterclockwise
+    // Barcode C → special barcode #3 pattern
+    if(code == "123456789012")
+        startSquare(true);
+    else if(code == "051111407592")
+        startSquare(false);
+    else if(code == "705632441947")
+        startBarcode3();
+    else
+        ROS_WARN("invalid barcode");
+}
+
+int main(int argc, char **argv)
+{
+    ros::init(argc, argv, "barcode_navigation_node");
+    ros::NodeHandle nh;
+
+    vel_pub = nh.advertise<geometry_msgs::Twist>("/cmd_vel", 10);
+
+    ros::Subscriber tf_sub =
+        nh.subscribe("/tf", 10, tfCallback);
+
+    ros::Subscriber barcode_sub =
+        nh.subscribe("/barcode_confirmed", 10, barcodeCallback);
+
+    ros::spin();
+    return 0;
+}

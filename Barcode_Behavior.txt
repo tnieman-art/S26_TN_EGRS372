@@ -1,0 +1,65 @@
+// FILENAME:
+// barcode_behavior.cpp
+/* **********************************************/
+/*                                              */
+/*   Author:      Leo Mandoka & Trey Nieman     */
+/*   Date:        2/24/2026                     */
+/*   Project:     lab #4 for EGRS 372           */
+/*   Purpose:     Program mobile robot to       */
+/*                read and react to barcodes    */
+/*                (TurtleBot3, running ROS)     */
+/*                                              */
+/* **********************************************/
+
+//Which libaries will be used by the program.
+#include <ros/ros.h>
+#include <std_msgs/String.h>
+
+// Global variables:
+// last_barcode  = stores most recently received barcode string
+// counter       = counts consecutive identical barcode readings
+// pub           = publisher for confirmed barcode messages
+std::string last_barcode = "";
+int counter = 0;
+ros::Publisher pub;
+
+//Function loop to count the number of barcode signals recieved waiting until five is reached before passing the-
+//data to Naviagation_Node for opeartions.
+void callback(const std_msgs::String::ConstPtr& msg)
+{
+    // Check if the current barcode matches the previous one. 
+    // If it matches, increment counter.
+    // If different, reset counter and store new barcode.
+    // This prevents noise or partial reads from triggering false movement.
+    if (msg->data == last_barcode)
+    {
+        counter++;
+    }
+    else
+    {
+        last_barcode = msg->data;
+        counter = 1;
+    }
+    
+    // Require 5 consecutive identical readings to confirm barcode
+    // Prevents noise or partial reads from triggering movement
+    if (counter >= 5)
+    {
+        pub.publish(*msg);
+        ROS_INFO("Confirmed: %s", msg->data.c_str());
+    }
+}
+
+int main(int argc, char** argv)
+{ 
+    // Print confirmed barcode to terminal for debugging/verification.
+    ros::init(argc, argv, "barcode_confirm_node");
+    ros::NodeHandle nh;
+
+    pub = nh.advertise<std_msgs::String>("/barcode_confirmed", 10);
+    ros::Subscriber sub = nh.subscribe("/barcode", 10, callback);
+
+    ros::spin();
+
+    return 0;
+}
