@@ -1,0 +1,94 @@
+// FILENAME: goal_sender.cpp
+/* **********************************************/
+/*                                              */
+/*   Author:      Leo Mandoka & Trey Nieman     */
+/*   Date:        3/23/2026                     */
+/*   Project:     Lab #5 for EGRS 372           */
+/*   Purpose:     Program a mobile robot to     */
+/*                use a lidar map to navigate   */
+/*                                              */
+/*                                              */
+/* **********************************************/
+#include "ros/ros.h"
+#include "geometry_msgs/PoseStamped.h"
+#include <iostream>
+#include <cmath>
+
+int main(int argc, char **argv)
+{
+    //Creates the ROS connection.
+    ros::init(argc, argv, "goal_sender"); //Registers the node name with ROS.
+    ros::NodeHandle n;
+
+    ros::Publisher goal_pub = n.advertise<geometry_msgs::PoseStamped>("/move_base_simple/goal", 10); //Publishes topic Move_Base_Simple/goal queue size 10 messages).
+
+    ros::Duration(2.0).sleep();   // allow ROS connections to initialize
+
+    std::string frame; //Creates the reference coordinate frame.
+    double x, y, psi; //Target position (x, y) and yaw angle (psi in degrees).
+
+    //Gets the desired goal frame from the user.
+    std::cout << "Enter reference frame: ";
+    std::cin >> frame;
+
+    //Get the desired X-location from the user.
+    std::cout << "Enter x position: ";
+    std::cin >> x;
+
+    //Get the desired Y-location from the user.
+    std::cout << "Enter y position: ";
+    std::cin >> y;
+
+    //Get desired orientation (yaw angle in degrees)
+    std::cout << "Enter yaw angle (psi in degrees): ";
+    std::cin >> psi;
+
+    //Converts psi to radians.
+    double yaw = psi * M_PI / 180.0;
+
+    //Convert yaw angle (rotation about Z-axis) into quaternion components.
+    double qz = sin(yaw / 2.0);
+    double qw = cos(yaw / 2.0);
+
+    //Message to store target position and orientation.
+    geometry_msgs::PoseStamped goal;
+
+    //Define the frame of and timestamp.
+    goal.header.frame_id = frame;
+    goal.header.stamp = ros::Time::now();
+
+    //Set MR's target goal based on the user inputs.
+    goal.pose.position.x = x;
+    goal.pose.position.y = y;
+    goal.pose.position.z = 0;
+
+    //Sets MR's target orientation based on the user inputs.
+    goal.pose.orientation.x = 0;
+    goal.pose.orientation.y = 0;
+    goal.pose.orientation.z = qz;
+    goal.pose.orientation.w = qw;
+
+    ROS_INFO("Waiting for subscriber..."); //Check ROS connection
+
+    //Connects to ensure the goal is received and ROS is active, then sets it to sleep to avoid waiting.
+    while (goal_pub.getNumSubscribers() == 0 && ros::ok())
+    {
+        ros::Duration(0.5).sleep();
+    }
+
+    //Publish the node to ROS.
+    ROS_INFO("Publishing goal...");
+
+    //Sets a for loop to refresh the message, send the goal, then pause for 0.2 seconds between steps.
+    for(int i = 0; i < 5; i++)
+    {
+        goal.header.stamp = ros::Time::now();
+        goal_pub.publish(goal);
+        ros::Duration(0.2).sleep();
+    }
+
+    //Pauses program for 1 second to ensure publish messages are sent.
+    ros::Duration(1.0).sleep();
+
+    return 0;
+}
