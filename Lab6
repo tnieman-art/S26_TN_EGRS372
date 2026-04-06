@@ -1,0 +1,247 @@
+// Lab6.cpp
+/* **********************************************/
+/*                                              */
+/*   Author:      Trey Nieman and Leo           */
+/*   Date:        3/16/26                       */
+/*   Project:     lab #6 for EGRS 372           */
+/*   Purpose:     Program TurtleBot3 to         */
+/*                move until bumper hits,       */
+/*                turn 90 degrees, and count    */
+/*                wall hits on 7-segment LED    */
+/*                                              */
+/* **********************************************/
+
+//Define libraries for the program
+#include "ros/ros.h"
+#include <iostream>
+#include <cmath>
+#include "geometry_msgs/Twist.h"
+#include "tf/tfMessage.h"
+#include "std_msgs/Byte.h"    // for bumper
+#include "std_msgs/Int32.h"   // for 7-segment LED
+#include <signal.h>
+
+//defined constants for equations.
+#define INITIALIZE_VALUE -1
+#define PI 3.14159
+
+// -------------------------
+// Global variables
+// -------------------------
+bool flag = false;        //Flag for movement/turning.
+double current_angle = 0; //Start angle of the MR.
+double target_speed = 0.0; //Target speed of the MR.
+double target_angle = INITIALIZE_VALUE; //Sets target angle to -1.
+double initialx = INITIALIZE_VALUE; //Starts X at -1.
+double initialy = INITIALIZE_VALUE; //Starts Y at -1.
+ros::Publisher vel_pub; //Publishes ROS program.
+
+bool bumper_hit = false;  //Flag for true when bumper pressed.
+int hit_count = 0;        //Sets number of hits for LED.
+
+// -------------------------
+// Forward movement callback
+// -------------------------
+void forwardprog(const tf::tfMessage cvalue)
+{
+    //Stores the initial robot position on first callback (for reference/debug).
+    if(initialx == INITIALIZE_VALUE || initialy == INITIALIZE_VALUE)
+    {
+        initialx = cvalue.transforms[0].transform.translation.x;
+        initialy = cvalue.transforms[0].transform.translation.y;
+    }
+
+    //Stops motion if the bumper strikes an object, triggering the flag.
+    if(bumper_hit)
+    {
+        flag = false;
+    }
+
+    //Set constant forward velocity.
+    target_speed = 0.1;  //Set for safe speed.
+}
+
+
+// -------------------------
+// Turn 90 degrees callback
+// -------------------------
+void Turnprog(const tf::tfMessage cvalue)
+{
+    //Stores the initial robot position on the first callback (for reference/debug).
+    double turnz = cvalue.transforms[0].transform.rotation.z;
+    double turnw = cvalue.transforms[0].transform.rotation.w;
+
+    //Converts quaternion (z,w) to yaw angle (Rotation z-axis)
+    current_angle = 2 * atan2(turnz, turnw);
+
+    //Normalize angle to range (0,2pi).
+    if(current_angle < 0) current_angle += 2*PI;
+    if(current_angle >= 2*PI) current_angle -= 2*PI;
+
+    //Sets target angle 90-degree turn (pi/2 radians).
+    if(target_angle == INITIALIZE_VALUE)
+        target_angle = current_angle + PI/2;
+
+    //Compute minimum angular distance to target.
+    if(target_angle < 0) target_angle += 2*PI;
+    if(target_angle >= 2*PI) target_angle -= 2*PI;
+
+    //Set angular velocities proportional to distance (Including a slowdown on approach).
+    double mindist = std::abs(target_angle - current_angle);
+    if(std::abs(target_angle - current_angle + 2*PI) < mindist)
+        mindist = std::abs(target_angle - current_angle + 2*PI);
+
+    target_speed = mindist / PI + 0.5;
+ 
+    //Stop rotation when close enough to the target angle.
+    if(std::abs(current_angle - target_angle) < 0.05) // stop turn
+        flag = false;
+}
+
+// -------------------------
+// Bumper callback
+// -------------------------
+void bumperCallback(const std_msgs::Byte& msg)
+{
+    if(msg.data != 0)
+        bumper_hit = true; //Sets bump flag to be true if the bumper strikes an object.
+}
+
+
+//Function to stop the robot with Ctrl+C.
+void mySigintHandler(int sig)
+{
+    geometry_msgs::Twist stop_msg;
+
+    //Set linear and angular velocities to zero (cease motion).
+    stop_msg.linear.x = 0.0;
+    stop_msg.angular.z = 0.0;
+
+    ROS_WARN("Ctrl+C pressed! Stopping robot...");
+
+    //Publish the stop command to the MR,
+    for(int i = 0; i < 20; i++)
+    {
+        vel_pub.publish(stop_msg);
+        ros::Duration(0.01).sleep(); //Set a small delay to ensure the message will be received.
+    }
+
+    //Ends ROS.
+    ros::shutdown();
+}
+
+// -------------------------
+// Main function
+// -------------------------
+int main(int argc, char **argv)
+{
+    //Intitalize ROS node without a default Ctrl+C handler.
+    ros::init(argc, argv, "Lab6", ros::init_options::NoSigintHandler);
+    //Registers a custom Ctrl+C.
+    signal(SIGINT, mySigintHandler);
+    //Create ROS communication node.
+    ros::NodeHandle n;
+
+    //Initialize publishers and subscribers for motion control, sensors, and display.
+    vel_pub = n.advertise<geometry_msgs::Twist>("cmd_vel", 1000); //Publishes a velocity commands to robot.
+    ros::Subscriber tf_sub; //Scribes to tf_sub data.
+    ros::Subscriber bumper_sub = n.subscribe("bumper", 10, bumperCallback); //Subscribes to Bumper node.
+    ros::Publisher led_pub = n.advertise<std_msgs::Int32>("led_data", 10); //Publishes to the LED node.
+    std_msgs::Int32 led_msg; //Message to store and send an LED msg.
+
+    //Set loop rate to control execution freq.
+    ros::Rate loop_rate(1000);
+    //Velocity command (linear and angular)
+    geometry_msgs::Twist c;
+    //Initalized robot velocity to zero (stops the robot).
+    c.linear.x = 0.0;
+    c.angular.z = 0.0;
+
+    //Waits for user input.
+    char input = 0;
+    std::cout << "Type 'y' and enter to begin: "; //User start command.
+    //Waits for user input.
+    while(input != 'y' && ros::ok())
+        std::cin >> input;
+
+    // Main loop
+    while(ros::ok()) //Checks if ROS is active.
+    {
+        // -------- MOVE FORWARD UNTIL BUMPER HIT --------
+        flag = true; //Checks if the bumper has struck an object.
+        initialx = INITIALIZE_VALUE; //Sets X to the default value.
+        initialy = INITIALIZE_VALUE; //Sets Y to the default value.
+        bumper_hit = false; //Sets bumper to false.
+
+        //Subscribe to TF topic to receive position data for forward motion control.
+        tf_sub = n.subscribe("/tf", 1, forwardprog);
+
+        while(flag && ros::ok()) //Checks if the flag is active and ROS is on.
+        {
+            c.linear.x = target_speed; //Sets forward speed to linear.
+            c.angular.z = 0.0; //Sets angle to zero (no rotation).
+            vel_pub.publish(c); //Publishes velocity command.
+
+            ros::spinOnce(); //Process incoming message.
+            loop_rate.sleep(); //Maintain loop rate.
+        }
+
+        tf_sub.shutdown(); //Unsubscribes from TF_Sub.
+
+        // STOP ROBOT
+        c.linear.x = 0.0; //Sets speed to zero.
+        c.angular.z = 0.0; //Sets angle to zero.
+        vel_pub.publish(c); //Publish velocity command to control robot motion.
+
+        // Increment hit count and update LED
+        if(bumper_hit)
+        {
+            hit_count++; //Increases variable.
+            led_msg.data = hit_count; //Displays message.
+            led_pub.publish(led_msg); //Publishes to LED board.
+        }
+
+// -------- MOVE BACKWARD FOR 1.5 SECONDS --------
+ros::Time start_time = ros::Time::now(); //Records the current time to track the length of the action.
+
+//Move the robot backward for 1.5 seconds while ROS is running
+while((ros::Time::now() - start_time).toSec() < 1.5 && ros::ok())
+{
+   c.linear.x = -0.2; //Backward linear motion.
+   c.angular.z = 0.0; //Sets angle to zero.
+
+    vel_pub.publish(c); //Publishes to robot.
+    ros::spinOnce(); //Processes incoming messages.
+    loop_rate.sleep(); //Maintain loop.
+}
+
+// STOP AFTER BACKWARD
+c.linear.x = 0.0; //Ceases linear motion.
+c.angular.z = 0.0; //Ceases angle motion.
+vel_pub.publish(c); //Publishes to robot.
+
+        // -------- TURN 90 DEGREES --------
+        flag = true; //Sets the flag to rotate 90 degrees to true.
+        target_angle = INITIALIZE_VALUE; //sets angle to the initial value.
+        tf_sub = n.subscribe("/tf", 1, Turnprog); //Subscribe to tf_sub.
+
+        while(flag && ros::ok()) //While the flag is active and the ROS is live.
+        {
+            c.linear.x = 0.0; //Sets speed to zero.
+            c.angular.z = target_speed; //rotates to the target speed.
+            vel_pub.publish(c); //Publish to robot.
+
+            ros::spinOnce(); //Processes incoming messages.
+            loop_rate.sleep(); //Maintain loop.
+        }
+        tf_sub.shutdown(); //Unsubscribes from tf_sub.
+
+        // STOP AFTER TURN
+        c.linear.x = 0.0; //Sets linear speed to zero (Ceases motion).
+        c.angular.z = 0.0; //Ceases motion in angular speed.
+        vel_pub.publish(c); //Publishes to Vel_Pub.
+
+        // Increment target angle for next turn
+        target_angle += PI/2;
+    }
+}
