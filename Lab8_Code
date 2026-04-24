@@ -1,0 +1,403 @@
+ // Lab8.cpp
+/* **********************************************/
+/*                                              */
+/*   Author:      Trey Nieman and Leo           */
+/*   Date:        4/11/26                       */
+/*   Project:     lab #9 for EGRS 372           */
+/*   Purpose:     Program TurtleBot3 to         */
+/*                accept user input to control  */
+/*                the MR's various states.      */
+/*                                              */
+/*                                              */
+/* **********************************************/
+
+// Creates the necessary ROS libraries for communication, messaging, and robot control  
+#include "ros/ros.h"
+#include "geometry_msgs/PoseStamped.h"          // Used for goal positions (navigation targets)
+#include "actionlib_msgs/GoalID.h"              // Used to cancel navigation goals
+#include "move_base_msgs/MoveBaseActionResult.h"// Used to receive navigation results (goal reached, failed, etc.)
+#include "sensor_msgs/BatteryState.h"           // Used to monitor battery voltage and status
+#include "std_msgs/Byte.h"                      // General byte messaging (e.g., bumper states)
+#include <boost/bind.hpp>                       // Used for callback function binding
+#include "std_msgs/Int32.h"                     // Used to control/display 7-segment LED values
+
+// Custom service/message headers for MR behaviors
+#include "egrs372_lab7/turtlebot_status.h"      // Custom status message (errors, warnings, etc.)
+#include "egrs372_lab7/go_home.h"               // Service to send robot to home position
+#include "egrs372_lab7/return_to_work.h"        // Service to resume normal operation
+#include "egrs372_lab7/update_count.h"          // Service to update/display counters
+
+// --- Global Variables ---
+// Flags used to track robot state and events
+bool goal_reached = false;     // True when navigation goal is successfully reached
+bool battery_low = false;      // True when battery voltage drops below threshold
+bool bumper_hit = false;       // True when bumper sensor detects collision
+
+// State machine tracking
+int state = 0;                 // Current robot state
+int last_state = -1;           // Used to prevent repeated goal sending
+int previous_state = 0;        // Stores last working state before interruption
+
+// Counters
+int low_counter = 0;           // Counts consecutive low battery readings
+int high_counter = 0;          // Counts consecutive healthy battery readings
+int hit_count = 0;             // Counts completed pick/place cycles
+
+//Battery Monitoring.
+float current_battery_voltage = 0.0;
+
+//Send MR home
+bool user_force_home = false;
+//Receive error messages
+egrs372_lab7::turtlebot_status status_msg;
+
+// Coordinates to be filled by Parameters
+double home_x, home_y, home_theta;
+double pick_x, pick_y, pick_theta;
+double place_x, place_y, place_theta;
+
+
+
+// UPDATE COUNT
+//function for the update count service
+//The service requests a new count for the LED
+//the service responds with the old LED count
+bool update_count(egrs372_lab7::update_count::Request  &req, egrs372_lab7::update_count::Response &res)
+{
+ //creates a new Node handler to publish the data inside this service
+ ros::NodeHandle m;
+
+ //creates the publisher for the LED data
+ ros::Publisher LED_pub = m.advertise<std_msgs::Int32>("led_data", 1);
+
+ //creates the message variable
+ std_msgs::Int32 LED_update;
+
+ //sets the response to the old number of places
+ res.old_count = hit_count;
+
+ //updates the places with the request
+ hit_count = req.new_count;
+
+ //updates the message variable with the new number
+ LED_update.data=hit_count;
+
+ //publishes the new LED data
+ LED_pub.publish(LED_update);
+
+ return true;
+}
+
+// SERVICE: Force Robot Home
+bool go_home(egrs372_lab7::go_home::Request &req, egrs372_lab7::go_home::Response &res)
+{
+// Return previous job for user feedback
+if(previous_state == 0) res.old_job = "Home";
+else if(previous_state == 1) res.old_job = "Pick";
+else if(previous_state == 2) res.old_job = "Place";
+
+user_force_home = true; // Activate override
+return true;
+}
+
+// SERVICE: Resume Work
+bool return_to_work(egrs372_lab7::return_to_work::Request &req, egrs372_lab7::return_to_work::Response &res)
+{
+if(previous_state == 0) res.old_job = "Home";
+else if(previous_state == 1) res.old_job = "Pick";
+else if(previous_state == 2) res.old_job = "Place";
+
+user_force_home = false; // Disable override
+return true;
+}
+
+
+
+
+// Helper: Stop all movement
+void stopRobot(ros::Publisher& cancel_pub) {
+actionlib_msgs::GoalID cancel_msg;
+cancel_pub.publish(cancel_msg);
+ROS_WARN("STOP COMMAND SENT: All goals canceled.");
+}
+
+// Send Goal
+void sendGoal(ros::Publisher& pub, double x, double y, double theta) {
+geometry_msgs::PoseStamped goal;
+goal.header.frame_id = "map";
+goal.header.stamp = ros::Time::now();
+goal.pose.position.x = x;
+goal.pose.position.y = y;
+goal.pose.orientation.z = sin(theta / 2.0);
+goal.pose.orientation.w = cos(theta / 2.0);
+goal_reached = false;              
+pub.publish(goal);
+}
+
+// Callbacks
+// Check if the MR goal is reached
+void resultCallback(const move_base_msgs::MoveBaseActionResult::ConstPtr& msg) {
+if (msg->status.status == 3)
+{
+ROS_INFO("Goal Reached.");
+goal_reached = true;
+}
+}
+
+
+
+// LowBattery Callback
+// Battery monitoring.
+void batteryCallback(const sensor_msgs::BatteryState::ConstPtr& msg, ros::Publisher& cancel_pub)
+{
+
+float voltage = msg->voltage;
+current_battery_voltage = voltage;
+
+// Count consecutive low readings
+if (voltage <= 10.5)
+{
+low_counter++;
+}
+else
+{
+low_counter = 0;  // reset if not low
+}
+
+// Count 'healthy' readings
+if (voltage > 10.5)
+{
+high_counter++;
+}
+else
+{
+high_counter = 0;  // reset if not low
+}
+
+// Confirm LOW only after 10 consecutive readings
+if (low_counter >= 10 && !battery_low)
+{
+ROS_ERROR("LOW BATTERY! Redirecting Home...");
+battery_low = true;
+stopRobot(cancel_pub);
+state = 3;
+}
+// Only clear after 10 high voltage readings
+else if (high_counter >= 10 && battery_low)
+{
+ROS_INFO("BATTERY CHARGED");
+if(previous_state == 1){
+ROS_INFO("Moving to Pick");}
+else if(previous_state == 2){
+ROS_INFO("Moving to Place");}
+
+battery_low = false;
+state = previous_state;
+}
+}
+
+
+// Bumper Callback
+// Checks if bumper actives
+void bumperCallback(const std_msgs::Byte& msg) {
+if(msg.data != 0) bumper_hit = true;
+}
+
+// Start of Main
+int main(int argc, char **argv) {
+
+//Initialize ROS and create the node.
+ros::init(argc, argv, "goal_manager");
+ros::NodeHandle n;
+ 
+//Send navigation goals to move_base
+ros::Publisher goal_pub = n.advertise<geometry_msgs::PoseStamped>("/move_base_simple/goal", 10);
+//Cancels current nav goals (E-stop)
+ros::Publisher cancel_pub = n.advertise<actionlib_msgs::GoalID>("/move_base/cancel", 1);
+ros::Subscriber res_sub = n.subscribe("/move_base/result", 1, resultCallback);
+//Publishes robot status
+ros::Subscriber bumper_sub = n.subscribe("bumper", 10, bumperCallback);
+//Subs to battery amount
+ros::Subscriber bat_sub = n.subscribe<sensor_msgs::BatteryState>("/battery_state", 1, boost::bind(batteryCallback, _1, boost::ref(cancel_pub)));
+//Publish the hit count on the LED
+ros::Publisher led_pub = n.advertise<std_msgs::Int32>("led_data", 10);
+std_msgs::Int32 led_msg;
+
+// Status Publisher
+ros::Publisher status_pub = n.advertise<egrs372_lab7::turtlebot_status>("TurtleBot_Status", 1);
+
+// Service Servers
+//Force robot home
+ros::ServiceServer srv1 = n.advertiseService("go_home", go_home);
+//resume task
+ros::ServiceServer srv2 = n.advertiseService("return_to_work", return_to_work);
+//update LED
+ros::ServiceServer srv3 = n.advertiseService("update_count", update_count);
+
+//run a 5hz loop
+ros::Rate loop_rate(5);
+ros::Duration(3.0).sleep();
+
+//Initialize LED display with current count of hits.
+led_msg.data = hit_count;
+led_pub.publish(led_msg);
+egrs372_lab7::turtlebot_status status_msg;
+
+ROS_INFO("Press ENTER to start...");
+std::cin.get();
+
+
+
+while (ros::ok()) {
+//process incoming messages
+ros::spinOnce();
+
+
+// Get Parameters from Launch File [cite: 48-50]
+ros::param::get("/home_location/x", home_x);
+ros::param::get("/home_location/y", home_y);
+ros::param::get("/home_location/theta", home_theta);
+ros::param::get("/pick_location/x", pick_x);
+ros::param::get("/pick_location/y", pick_y);
+ros::param::get("/pick_location/theta", pick_theta);
+ros::param::get("/place_location/x", place_x);
+ros::param::get("/place_location/y", place_y);
+ros::param::get("/place_location/theta", place_theta);
+
+// Update Status Message for monitoring
+status_msg.battery = current_battery_voltage;
+status_msg.place_count = hit_count;
+
+
+// Override logic: if user forced home or battery is low, go to state 3
+if (user_force_home && state != 3 && state != 4) {
+previous_state = state;
+state = 4;
+last_state = -1;
+}
+
+switch (state) {
+case 0: // --- STATE: HOME ---
+//Send MR to home.
+if (last_state != state) {
+ros::Duration(2.0).sleep();
+sendGoal(goal_pub, home_x, home_y, home_theta);
+status_msg.current_job = "Moving to Home";
+last_state = state;
+previous_state = state;
+}
+//Update status when the goal is reached
+if (goal_reached) { status_msg.current_job = "At Home";}
+// Transition: Must be home AND battery must be charged
+if (goal_reached && !battery_low) {
+ROS_INFO("Moving to Pick.");
+state = 1;
+last_state = -1;
+goal_reached = false;
+bumper_hit = false; // Reset bumper for pick
+}
+break;
+
+case 1: // --- PICK ---
+//Pick state
+status_msg.current_job = "Moving to Pick";
+
+// This 'if' ensures we send the goal EXACTLY ONCE
+if (last_state != state) {
+sendGoal(goal_pub, pick_x, pick_y, pick_theta);
+last_state = state; // Latch it so we don't send again
+previous_state = state;
+bumper_hit = false;
+}
+// Transition when both goals are reached and object detected (bumper)
+ if (goal_reached) { status_msg.current_job = "At Pick";}
+if (goal_reached && bumper_hit) {
+ROS_INFO("Pick Success! Moving to Place...");
+ 
+
+// Reset flags for the NEXT state
+goal_reached = false;
+bumper_hit = false;
+ 
+// Change the state
+state = 2;
+last_state = -1; // This allows the NEXT state to send its goal once
+}
+break;
+
+case 2: // --- STATE: PLACE ---
+//Place state for the MR
+status_msg.current_job = "Moving to Place";
+
+if (last_state != state) {
+ros::Duration(2.0).sleep();
+sendGoal(goal_pub, place_x, place_y, place_theta);
+last_state = state;
+previous_state = state;
+bumper_hit = false;
+}
+// on successful placement (Goal and bump)
+  if (goal_reached) { status_msg.current_job = "At Place";}
+if (goal_reached && bumper_hit) {
+ROS_INFO("Place Success. Returning to Pick...");
+
+hit_count++;
+//LED display state.
+led_msg.data = hit_count;
+led_pub.publish(led_msg);
+// Loop back to PICK
+state = 1;
+last_state = -1;
+goal_reached = false;
+bumper_hit = false;
+}
+break;
+
+
+case 3: // --- STATE: HOME ---
+//Battery is low, send home.
+status_msg.current_job = "Low Battery, Moving to Home to Recharge";
+
+if (last_state != state) {
+ros::Duration(2.0).sleep();
+sendGoal(goal_pub, home_x, home_y, home_theta);
+ROS_INFO("Moving to Home...");
+last_state = state;
+
+}
+if (goal_reached) { status_msg.current_job = "At Home";}
+// Transition: Must be home AND battery must be charged
+if (goal_reached && !battery_low) {
+state = previous_state;
+last_state = -1;
+goal_reached = false;
+bumper_hit = false; // Reset bumper for pick
+}
+break;
+
+
+
+case 4: // --- STATE: HOME (Forced) ---
+//User forced MR to home state.
+status_msg.current_job = "Moving to Home (Forced)";
+
+if (last_state != state) {
+ros::Duration(2.0).sleep();
+sendGoal(goal_pub, home_x, home_y, home_theta);
+last_state = state;
+
+}
+if (goal_reached) { status_msg.current_job = "At Home";}
+// Transition: Must be home AND battery must be charged
+// Transition back ONLY if called back to work
+if (!user_force_home) {
+state = previous_state;
+last_state = -1;
+}
+break;
+}
+status_pub.publish(status_msg); // Publish monitoring info
+loop_rate.sleep();
+}
+return 0;
+}
