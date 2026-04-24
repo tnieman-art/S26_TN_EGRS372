@@ -1,0 +1,201 @@
+// Lab9.cpp
+/* **********************************************/
+/*                                              */
+/*   Author:      Trey Nieman and Leo           */
+/*   Date:        4/21/26                       */
+/*   Project:     lab #9 for EGRS 372           */
+/*   Purpose:     Program TurtleBot3 to         */
+/*                accept user input to control  */
+/*                the MR's various states.      */
+/*                                              */
+/*                                              */
+/* **********************************************/
+
+// Set of required libaries to run the program
+#include <ros/ros.h>
+#include <move_base_msgs/MoveBaseAction.h>
+
+// Libaries to operate the change parameters feature
+#include <actionlib/client/simple_action_client.h>
+#include <dynamic_reconfigure/Reconfigure.h>
+#include <dynamic_reconfigure/Config.h>
+#include <dynamic_reconfigure/DoubleParameter.h>
+// Libaries to read the txt file of parameters
+#include <egrs372_lab9/ParamUpdate.h> 
+#include <fstream>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <cstdlib> 
+#include <iostream>
+
+// Alias for the move_base action client used to send navigation goals. 
+typedef actionlib::SimpleActionClient<move_base_msgs::MoveBaseAction> MoveBaseClient;
+
+// Struct to hold parameters from the text file
+struct RobotBehavior 
+{
+	// Reads in the four variables from the txt file to be passed as parameters.
+    double max_linear;
+    bool allow_backward;
+    double max_rot;
+    bool adjust_orientation;
+};
+
+// Publishes and recieves services.
+ros::Publisher pub;
+ros::ServiceClient client;
+
+// Applies a behavior profile by dynamically updating DWA planner parameters
+// using the ROS dynamic_reconfigure service. 
+void setBehavior(const RobotBehavior& b) 
+{
+	// Reads the text file to create the changed parameters of the MR for operation
+	
+	// Calls on the reconfigure service
+    dynamic_reconfigure::Reconfigure srv;
+    dynamic_reconfigure::Config conf;
+
+	// Dynamically reconfigures the MR parameters from the text file
+    dynamic_reconfigure::DoubleParameter max_x, min_x, max_rot, yaw_tol;
+    
+	// Reads the max velocity and translates it to the MR parameters
+    max_x.name = "max_vel_x";
+    max_x.value = b.max_linear;
+    
+	// Reads the min velocity and translates it to the MR parameters
+    min_x.name = "min_vel_x";
+    min_x.value = b.allow_backward ? -0.1 : 0.0; 
+
+	// Reads the max rotation speed and translates it to the MR parameters
+    max_rot.name = "max_rot_vel";
+    max_rot.value = b.max_rot;
+
+	// Reads the yaw tolerances and translates it to the MR parameters
+    yaw_tol.name = "yaw_goal_tolerance";
+    yaw_tol.value = b.adjust_orientation ? 0.17 : 10.0;
+
+    conf.doubles.push_back(max_x);
+    conf.doubles.push_back(min_x);
+    conf.doubles.push_back(max_rot);
+    conf.doubles.push_back(yaw_tol);
+
+	// Calls on a previous lab to config the parameter update.
+    srv.request.config = conf;
+
+ 	 egrs372_lab9::ParamUpdate msg;
+	
+	// Publishes the changed values to the screen for user verification. 
+	msg.max_vel_x = max_x.value;
+	msg.min_vel_x = min_x.value;
+	msg.max_rot_vel = max_rot.value;
+	msg.yaw_goal_tolerance = yaw_tol.value;
+
+	if (client.call(srv)) {
+ 	   ROS_INFO("Dynamic reconfigure success");
+	} else {
+ 	   ROS_WARN("Failed to call dynamic_reconfigure service");
+}
+
+pub.publish(msg);  // ALWAYS publish
+}
+
+// --- Send Goal ---
+// Function to send the MR a given set of variables to naviagte to a chosen pose.
+void sendGoal(ros::Publisher& pub, double x, double y, double z, double w) {
+    std::cout << ">>> Press ENTER to move to the next location <<<" << std::endl;
+    std::cin.get();
+    geometry_msgs::PoseStamped goal;
+    goal.header.frame_id = "map"; 
+    goal.header.stamp = ros::Time::now(); 
+    goal.pose.position.x = x;
+    goal.pose.position.y = y;
+    goal.pose.orientation.z = z;
+    goal.pose.orientation.w = w;
+    goal_reached = false;              
+    pub.publish(goal);
+}
+
+int main(int argc, char** argv) 
+{
+    ros::init(argc, argv, "goal_manager");
+    ros::NodeHandle nh;
+    ros::Publisher goal_pub = nh.advertise<geometry_msgs::PoseStamped>("/move_base_simple/goal", 10);
+
+	// Publishes the parameters to the MR for use in the variables of motion. 
+    pub = nh.advertise<egrs372_lab9::ParamUpdate>("parameter_updates", 10);
+	// Updates parameters in real time.
+    client = nh.serviceClient<dynamic_reconfigure::Reconfigure>("/move_base/DWAPlannerROS/set_parameters");
+    MoveBaseClient ac("move_base", true);
+
+	// Waits for naviagtion to be finished before sending the net goal. 
+    while(!ac.waitForServer(ros::Duration(5.0))) 
+	{
+        ROS_INFO("Waiting for move_base...");
+    }
+
+    // Read file
+    std::vector<RobotBehavior> behaviors;
+    std::ifstream file("/home/egrs372/catkin_ws/src/egrs372_lab9/parameters.txt");
+
+	// Checks if the file opened incorrectly. 
+    if (!file.is_open()) 
+	{
+        ROS_ERROR("Failed to open parameters.txt");
+        return 1;
+    }
+
+    std::string line;
+	// Reads the text document for parameters.
+    while (std::getline(file, line)) 
+	{
+        if(line.empty()) continue;
+
+        std::stringstream ss(line);
+        std::string val;
+        RobotBehavior b;
+	
+		// Finds various variables based on the pressences of , before storing them into a int.
+        std::getline(ss, val, ','); b.max_linear = std::atof(val.c_str());
+        std::getline(ss, val, ','); b.allow_backward = (val == "t");
+        std::getline(ss, val, ','); b.max_rot = std::atof(val.c_str());
+        std::getline(ss, val, ','); b.adjust_orientation = (val == "t");
+
+		// Sets behavior based on the given parameter line. 
+        behaviors.push_back(b);
+    }
+
+	// Sanity check that it didn't read more then five locations. 
+    if(behaviors.size() >= 5) 
+	{
+        
+		// Send the MR to the first point with a function with the parameters of behavior 1 
+        sendGoal(goal_pub,2.09, 2.17, 0.55, 0.83);
+        setBehavior(behaviors[0]);
+
+		// Send the MR to the second point with a function with the parameters of behavior 2
+        sendGoal(goal_pub,1.49, 0.98, 0.97, 0.22);
+        setBehavior(behaviors[1]);
+
+		// Send the MR to the third point with a function with the parameters of behavior 3
+        sendGoal(goal_pub,0.63, -0.86, -0.22, 0.97);
+        setBehavior(behaviors[2]);
+
+		// Send the MR to the four point with a function with the parameters of behavior 4
+        sendGoal(goal_pub,-0.34, -2.58, 0.22, 0.97);
+        setBehavior(behaviors[3]);
+
+		// Send the MR to the five point with a function with the parameters of behavior 5 
+        sendGoal(goal_pub,-1.18, -4.27, 0.59, 0.80);
+        setBehavior(behaviors[4]);
+		
+    } else 
+	{
+		// Reads an error if they are more then five points or parameters
+        ROS_ERROR("parameters.txt must have at least 5 lines.");
+    }
+ 
+	// Displays the MR has reached all five positions.
+    ROS_INFO("All 5 locations complete. Mission finished.");
+    return 0;
+}
