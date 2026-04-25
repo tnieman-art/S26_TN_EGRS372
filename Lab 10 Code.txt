@@ -1,0 +1,488 @@
+	// Lab10.cpp
+	/* **********************************************/
+	/*                                              */
+	/*   Author:      Trey Nieman and Leo           */
+	/*   Date:        4/24/26                       */
+	/*   Project:     lab #10 for EGRS 372           */
+	/*   Purpose:     Program TurtleBot3 to         */
+	/*                accept user input to control  */
+	/*                the MR's various states.      */
+	/*                                              */
+	/*                                              */
+	/* **********************************************/
+
+	// Include core ROS functionality (node setup, publishers/subscribers, timing, logging)
+	#include "ros/ros.h"
+
+	// Used to publish navigation goal positions to move_base
+	#include "geometry_msgs/PoseStamped.h"
+
+	// Used to cancel active navigation goals
+	#include "actionlib_msgs/GoalID.h"
+
+	// Used to receive move_base result messages (success, failure, etc.)
+	#include "move_base_msgs/MoveBaseActionResult.h"
+
+	// Used to monitor robot battery voltage, charge state, and status
+	#include "sensor_msgs/BatteryState.h"
+
+	// Generic 8-bit unsigned integer message type
+	// Often used for simple status values such as bumper states
+	#include "std_msgs/Byte.h"
+
+	// Used for binding callback functions with parameters
+	#include <boost/bind.hpp>
+
+	// Used to publish integer values (ex: 7-segment LED display)
+	#include "std_msgs/Int32.h"
+
+	// Used to dynamically update ROS parameters while running
+	#include <dynamic_reconfigure/Reconfigure.h>
+	#include <dynamic_reconfigure/DoubleParameter.h>
+
+	// Standard math functions (sqrt, pow, abs, etc.)
+	#include <cmath>
+
+	// Standard input/output streams (cout, endl, etc.)
+	#include <iostream>
+
+	// Action client library for sending goals to action servers
+	#include <actionlib/client/simple_action_client.h>
+
+	// move_base action definitions for navigation goals
+	#include <move_base_msgs/MoveBaseAction.h>
+
+	// Used to receive live feedback while robot is navigating
+	#include "move_base_msgs/MoveBaseActionFeedback.h"
+
+	// Boolean message type (true / false)
+	#include "std_msgs/Bool.h"
+
+	// Custom service for updating parameters in this project
+	#include "egrs372_lab9/ParamUpdate.h"
+
+	// Create a shorter alias for the move_base action client
+	typedef actionlib::SimpleActionClient<move_base_msgs::MoveBaseAction> MoveBaseClient;
+
+	// Crosswalk boundaries with the four corners of the cross walk (Corners 1->4)
+	#define X1 1.2
+	#define Y1 -2.8
+	#define X2 -1.01
+	#define Y2 -1.67
+	#define X3 1.52
+	#define Y3 -2.0
+	#define X4 -0.2
+	#define Y4 -0.79
+
+	// Human sensing distance threshold
+	// Sets a minimum distance to consider a human is nearby.
+	#define HUMAN_THRESHOLD 0.5
+
+	// Global variables
+	ros::Publisher motor_power_pub;
+	// Service call
+	ros::ServiceClient client;
+	ros::Publisher pub;
+
+	// MR Current POS
+	geometry_msgs::Point current_position;
+	// Human MR POS
+	geometry_msgs::Point human_position;
+	// Human presence Flag
+	bool human_present = false;
+	// MR POS Flag
+	bool position_updated = false;
+	// MR POS movement reduction flag
+	bool speed_reduced = false;
+
+	// Store original speeds
+	// Max Velocities
+	double original_max_vel = 0.0;
+	// Min Velocities
+	double original_min_vel = 0.0;
+	// Max Rotation Velocities
+	double original_max_rot = 0.0;
+
+	// Check to avoid sending duplicate updates, parameters values
+	double last_max_vel = -1;
+	double last_min_vel = -1;
+	double last_max_rot = -1;
+	double last_yaw_tol = -1;
+
+	// Desired maximum linear velocity
+	double max_vel1;
+	// Desired minimum linear velocity
+	double min_vel1;
+	// Desired maximum rotational velocity
+	double max_rot1;
+	// Desired yaw tolerance for navigation goal
+	double yaw_tol1;
+
+	// Publish flag
+	bool first_publish = true;
+
+	// Flags for zone states
+	// Checks if the MR is in the Crosswalk
+	bool in_crosswalk = false;
+	// Checks if the MR is near a person
+	bool near_human = false;
+	// Check if motors are stopped
+	bool motors_stopped = false;
+
+	// Check if point is inside the crosswalk polygon
+	bool isInCrosswalk(double x, double y)
+	{
+		// Using ray-casting algorithm for point-in-polygon test
+		// Crosswalk vertices: (X1,Y1), (X2,Y2), (X4,Y4), (X3,Y3)
+	   
+		int nvert = 4;
+		// Crosswalk x-coordinates
+		double vertx[] = {X1, X2, X4, X3};
+		// Crosswalk y-coordinates
+		double verty[] = {Y1, Y2, Y4, Y3};
+	   
+		int i, j;
+		// Returns false if it's outside the radius
+		bool inside = false;
+	   
+		for (i = 0, j = nvert - 1; i < nvert; j = i++) 
+		{
+			// Check if MR is in the crosswalk
+			if (((verty[i] > y) != (verty[j] > y)) &&
+				(x < (vertx[j] - vertx[i]) * (y - verty[i]) / (verty[j] - verty[i]) + vertx[i])) 
+				{
+					inside = !inside;
+				}
+		}
+	   
+		return inside;
+	}
+
+	// Calculate distance between two points
+	double distance(double x1, double y1, double x2, double y2)
+	{
+		return sqrt(pow(x2 - x1, 2) + pow(y2 - y1, 2));
+	}
+
+	// Callback for TurtleBot position feedback
+	void feedbackCallback(const move_base_msgs::MoveBaseActionFeedback::ConstPtr& msg)
+	{
+		// Save robot current x,y position
+		current_position.x = msg->feedback.base_position.pose.position.x;
+		current_position.y = msg->feedback.base_position.pose.position.y;
+		// Mark that valid position data exists
+		position_updated = true;
+	}
+
+	// Callback for human position
+	void humanCallback(const geometry_msgs::Point::ConstPtr& msg)
+	{
+	    // Save human coordinates
+		human_position.x = msg->x;
+		human_position.y = msg->y;
+		// Mark human as detected
+		human_present = true;
+	}
+
+	// Send Goal
+	void sendGoal(ros::Publisher& goal_pub, double x, double y, double z, double w)
+	{
+	   
+		geometry_msgs::PoseStamped goal;
+		
+		// goal map frame
+		goal.header.frame_id = "map";
+		goal.header.stamp = ros::Time::now();
+		// Goal position
+		goal.pose.position.x = x;
+		goal.pose.position.y = y;
+		// Goal orientation quaternion (z,w used here)
+		goal.pose.orientation.z = z;
+		goal.pose.orientation.w = w;
+	   
+	    // Publish goal
+		goal_pub.publish(goal);
+	}
+
+	// Restore normal robot speed settings
+	void restoreSpeed()
+	{
+		dynamic_reconfigure::Reconfigure srv;
+		dynamic_reconfigure::Config conf;
+
+		// Normal max forward speed
+		dynamic_reconfigure::DoubleParameter max_vel;
+		max_vel.name = "max_vel_x";
+		max_vel.value = 0.26;
+
+		// Normal reverse/min speed
+		dynamic_reconfigure::DoubleParameter min_vel;
+		min_vel.name = "min_vel_x";
+		min_vel.value = -0.13;
+
+		// Normal max rotational speed
+		dynamic_reconfigure::DoubleParameter max_rot;
+		max_rot.name = "max_rot_vel";
+		max_rot.value = 1.82;
+
+		// Add parameters to config request
+		conf.doubles.push_back(max_vel);
+		conf.doubles.push_back(min_vel);
+		conf.doubles.push_back(max_rot);
+
+		srv.request.config = conf;
+		// Send update to planner
+		client.call(srv);
+
+	// Save current values
+	max_vel1 = 0.26;
+	min_vel1 = -0.13;
+	max_rot1 = 1.82;
+	yaw_tol1 = 0.1;
+
+	}
+
+	// Reduce robot speed for crosswalk safety
+	void setSlowSpeed()
+	{
+		dynamic_reconfigure::Reconfigure srv;
+		dynamic_reconfigure::Config conf;
+
+		// Reduced forward speed
+		dynamic_reconfigure::DoubleParameter max_vel;
+		max_vel.name = "max_vel_x";
+		max_vel.value = 0.13;
+
+		// No reverse motion
+		dynamic_reconfigure::DoubleParameter min_vel;
+		min_vel.name = "min_vel_x";
+		min_vel.value = 0.0;
+
+		// Reduced turning speed
+		dynamic_reconfigure::DoubleParameter max_rot;
+		max_rot.name = "max_rot_vel";
+		max_rot.value = 1.0;
+
+		// Add parameters
+		conf.doubles.push_back(max_vel);
+		conf.doubles.push_back(min_vel);
+		conf.doubles.push_back(max_rot);
+
+		// Send update
+		srv.request.config = conf;
+		client.call(srv);
+
+		// Save values
+		max_vel1 = 0.13;
+		min_vel1 = 0;
+		max_rot1 = 1;
+		yaw_tol1 = 0.1;
+	}
+
+	// Disable robot motors immediately
+	void stopMotors()
+	{
+		std_msgs::Bool msg;
+		msg.data = false;
+		motor_power_pub.publish(msg);
+	}
+
+	// Re-enable robot motors
+	void startMotors()
+	{
+		std_msgs::Bool msg;
+		msg.data = true;
+		motor_power_pub.publish(msg);
+	}
+
+	// Checks if a human is nearby to stop the robot, or-
+	// checks if the MR is in a crosswalk and needs to slow
+	void updateSafetyBehavior()
+	{
+		// Get MR POS
+		if (!position_updated) return;
+
+		// Check crosswalk
+		in_crosswalk = isInCrosswalk(current_position.x, current_position.y);
+
+		// Check human distance
+		if (human_present)
+		{
+			double d = distance(current_position.x, current_position.y,
+								human_position.x, human_position.y);
+
+			near_human = (d < HUMAN_THRESHOLD);
+		}
+		else
+		{
+			near_human = false;
+		}
+
+		// See a human, MR Stops
+		if (near_human)
+		{
+			if (!motors_stopped)
+			{
+				ROS_WARN("Human detected nearby → STOPPING robot");
+				stopMotors();
+				motors_stopped = true;
+			}
+			return; // do nothing else while stopped
+		}
+		else
+		{
+			if (motors_stopped)
+			{
+				ROS_INFO("Human gone → RESUMING motion");
+				startMotors();
+				motors_stopped = false;
+			}
+		}
+
+		// IF the MR is in a crosswalks to slow down
+		if (in_crosswalk && !speed_reduced)
+	{
+	setSlowSpeed();
+	speed_reduced = true;
+	}
+
+	if (!in_crosswalk && speed_reduced)
+	{
+	restoreSpeed();
+	speed_reduced = false;
+	}
+
+	egrs372_lab9::ParamUpdate msg;
+
+	// --- decide desired values ---
+	if (in_crosswalk)
+	{
+		msg.max_vel_x = max_vel1;
+		msg.min_vel_x = min_vel1;
+		msg.max_rot_vel = max_rot1;
+	msg.yaw_goal_tolerance = 0.1;
+	}
+	else
+	{
+		msg.max_vel_x = max_vel1;
+		msg.min_vel_x = min_vel1;
+		msg.max_rot_vel = max_rot1;
+	msg.yaw_goal_tolerance = 0.1;
+	}
+
+
+
+	// --- check if anything changed ---
+	bool changed =
+		first_publish ||
+		msg.max_vel_x != last_max_vel ||
+		msg.min_vel_x != last_min_vel ||
+		msg.max_rot_vel != last_max_rot ||
+		msg.yaw_goal_tolerance != last_yaw_tol;
+
+	// --- publish only if changed ---
+	if (changed)
+	{
+		pub.publish(msg);
+
+		last_max_vel = msg.max_vel_x;
+		last_min_vel = msg.min_vel_x;
+		last_max_rot = msg.max_rot_vel;
+		last_yaw_tol = msg.yaw_goal_tolerance;
+
+		first_publish = false;
+	}
+
+	}
+
+
+
+	int main(int argc, char** argv)
+	{
+		// Start ROS
+		ros::init(argc, argv, "goal_manager_with_safety");
+		ros::NodeHandle nh;
+	   
+		// Publishers and subscribers
+		ros::Publisher goal_pub = nh.advertise<geometry_msgs::PoseStamped>("/move_base_simple/goal", 10);
+		motor_power_pub = nh.advertise<std_msgs::Bool>("/motor_power", 10);
+		pub = nh.advertise<egrs372_lab9::ParamUpdate>("param_update", 10);
+	   
+		// Subscribers
+		ros::Subscriber feedback_sub = nh.subscribe("/move_base/feedback", 10, feedbackCallback);
+		ros::Subscriber human_sub = nh.subscribe("human", 10, humanCallback);
+	   
+		// Service client
+		client = nh.serviceClient<dynamic_reconfigure::Reconfigure>("/move_base/DWAPlannerROS/set_parameters");
+	   
+		// Set oscillation distance to 0 to prevent giving up
+		dynamic_reconfigure::Reconfigure osc_srv;
+		dynamic_reconfigure::Config osc_conf;
+		dynamic_reconfigure::DoubleParameter osc_dist;
+		osc_dist.name = "oscillation_distance";
+		osc_dist.value = 0.0;
+		osc_conf.doubles.push_back(osc_dist);
+		osc_srv.request.config = osc_conf;
+	   
+		ros::ServiceClient osc_client = nh.serviceClient<dynamic_reconfigure::Reconfigure>("/move_base/set_parameters");
+		if (osc_client.call(osc_srv)) {
+			ROS_INFO("Set oscillation_distance to 0.0");
+		}
+	   
+		MoveBaseClient ac("move_base", true);
+
+	   std::cout << ">>> Press ENTER to move to <<<" << std::endl;
+	std::cin.get();
+
+		// Wait for navigation to be ready
+		while(!ac.waitForServer(ros::Duration(5.0)))
+		{
+			ROS_INFO("Waiting for move_base...");
+		}
+
+			// Create a separate thread to continuously check safety zones
+			ros::Rate loop_rate(10); // 10 Hz
+		   
+			// Goal tracking (X,Y,Z,W)
+			double goals[5][4] = {
+				{2.09, 2.17, 0.55, 0.83},
+				{1.49, 0.98, 0.97, 0.22},
+				{0.63, -0.86, -0.22, 0.97},
+				{-0.34, -2.58, 0.22, 0.97},
+				{-1.18, -4.27, 0.59, 0.80}
+			};
+		   
+	// Move to all five goals
+	for (int i = 0; i < 5 && ros::ok(); i++)
+	{
+		move_base_msgs::MoveBaseGoal goal;
+
+		goal.target_pose.header.frame_id = "map";
+		goal.target_pose.header.stamp = ros::Time::now();
+
+		goal.target_pose.pose.position.x = goals[i][0];
+		goal.target_pose.pose.position.y = goals[i][1];
+		goal.target_pose.pose.orientation.z = goals[i][2];
+		goal.target_pose.pose.orientation.w = goals[i][3];
+
+		ROS_INFO("Sending goal %d", i + 1);
+		ac.sendGoal(goal);
+
+		while (ros::ok())
+		{
+			ros::spinOnce();
+			updateSafetyBehavior();
+			loop_rate.sleep();
+
+			// Goal reached?
+			if (ac.getState() == actionlib::SimpleClientGoalState::SUCCEEDED)
+			{
+				ROS_INFO("Goal %d reached", i + 1);
+				break;
+			}
+		}
+	}
+	 
+		ROS_INFO("All 5 locations complete. Mission finished.");
+		return 0;
+	}
